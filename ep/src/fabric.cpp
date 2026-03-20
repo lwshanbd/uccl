@@ -504,6 +504,45 @@ int fabric_write_with_data(FabricCtx& ctx, int channel_idx,
   return (int)ret;
 }
 
+int fabric_write_batch(FabricCtx& ctx, int channel_idx,
+                       void* local_buf, size_t len,
+                       int dst_rank, uintptr_t remote_offset,
+                       void* context, bool is_last) {
+  fid_ep* ep = ctx.data_eps[channel_idx];
+  fi_addr_t dest = ctx.data_peer_addrs[channel_idx][dst_rank];
+  uint64_t remote_addr = remote_offset;
+  uint64_t rkey = ctx.remote_info[dst_rank].data_gpu_keys[channel_idx];
+  void* desc = ctx.data_gpu_mrs[channel_idx].desc;
+
+  struct iovec iov = {local_buf, len};
+  struct fi_rma_iov rma_iov = {remote_addr, len, rkey};
+  struct fi_msg_rma msg = {};
+  msg.msg_iov = &iov;
+  msg.desc = &desc;
+  msg.iov_count = 1;
+  msg.addr = dest;
+  msg.rma_iov = &rma_iov;
+  msg.rma_iov_count = 1;
+  msg.context = context;
+
+  // FI_MORE tells CXI to batch without ringing the doorbell.
+  // On the last write, omit FI_MORE to trigger transmission of
+  // the entire batch.
+  uint64_t flags = FI_COMPLETION;
+  if (!is_last) flags |= FI_MORE;
+
+  ssize_t ret;
+  do {
+    ret = fi_writemsg(ep, &msg, flags);
+    if (ret == -FI_EAGAIN) {
+      fi_cq_data_entry drain[16];
+      fi_cq_read(ctx.tx_cq, drain, 16);
+    }
+  } while (ret == -FI_EAGAIN);
+
+  return (int)ret;
+}
+
 int fabric_fetch_add(FabricCtx& ctx, int dst_rank,
                      uintptr_t remote_offset, uint64_t add_value,
                      uint64_t* local_result, void* context) {

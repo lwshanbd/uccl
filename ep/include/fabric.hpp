@@ -61,6 +61,13 @@ int fabric_write_with_data(FabricCtx& ctx, int channel_idx,
                            int dst_rank, uintptr_t remote_offset,
                            uint64_t cq_data, void* context, bool signaled);
 
+// Post an RMA write with FI_MORE batching.  Set |is_last| on the final
+// write in a batch to trigger transmission of all prior batched writes.
+int fabric_write_batch(FabricCtx& ctx, int channel_idx,
+                       void* local_buf, size_t len,
+                       int dst_rank, uintptr_t remote_offset,
+                       void* context, bool is_last);
+
 // Post a fetch-and-add atomic.  Returns 0 on success.
 int fabric_fetch_add(FabricCtx& ctx, int dst_rank,
                      uintptr_t remote_offset, uint64_t add_value,

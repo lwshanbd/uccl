@@ -37,6 +37,16 @@ struct uccl_comm_impl {
   void* gpu_buf;
   size_t gpu_buf_size;
 
+  // Per-rank info for intra/inter-node routing.
+  struct RankInfo {
+    char hostname[256];
+    int gpu_idx;
+    void* gpu_buf;       // remote GPU buffer (IPC-opened for same-node)
+    bool is_same_node;
+  };
+  std::vector<RankInfo> rank_info;
+  cudaStream_t copy_stream = nullptr;  // for intra-node cudaMemcpyPeerAsync
+
   // Proxy threads (kNumProxyThs per rank)
   std::vector<std::unique_ptr<UcclProxy>> proxies;
 
@@ -44,8 +54,6 @@ struct uccl_comm_impl {
   std::vector<uint64_t> d2h_addrs;
 
 #ifdef USE_LIBFABRIC
-  // Direct fabric context for CPU-initiated operations.
-  // The proxy threads have their own FabricCtx internally.
   FabricCtx cpu_fabric_ctx;
   bool cpu_ctx_initialized = false;
 #endif
@@ -136,6 +144,46 @@ int uccl_comm_init_mpi(uccl_comm_t* out_comm, void* mpi_comm_ptr,
     fprintf(stderr, "[uccl_comm] rank=%d: fabric context initialized\n", rank);
   }
 #endif
+
+  // Exchange hostnames and GPU IPC handles for intra-node routing.
+  {
+    struct RankExchange {
+      char hostname[256];
+      int gpu_idx;
+      cudaIpcMemHandle_t ipc_handle;
+    };
+
+    RankExchange my_info{};
+    gethostname(my_info.hostname, sizeof(my_info.hostname));
+    my_info.gpu_idx = gpu_idx;
+    cudaIpcGetMemHandle(&my_info.ipc_handle, gpu_buf);
+
+    std::vector<RankExchange> all_info(nranks);
+    MPI_Allgather(&my_info, sizeof(RankExchange), MPI_BYTE,
+                  all_info.data(), sizeof(RankExchange), MPI_BYTE, mpi_comm);
+
+    comm->rank_info.resize(nranks);
+    cudaStreamCreate(&comm->copy_stream);
+
+    for (int r = 0; r < nranks; r++) {
+      auto& ri = comm->rank_info[r];
+      strncpy(ri.hostname, all_info[r].hostname, sizeof(ri.hostname));
+      ri.gpu_idx = all_info[r].gpu_idx;
+      ri.is_same_node = (strncmp(hostname, all_info[r].hostname, 256) == 0);
+
+      if (r == rank) {
+        ri.gpu_buf = gpu_buf;  // self
+      } else if (ri.is_same_node) {
+        // Open IPC handle for same-node peer — enables NVLink access.
+        cudaIpcOpenMemHandle(&ri.gpu_buf, all_info[r].ipc_handle,
+                             cudaIpcMemLazyEnablePeerAccess);
+        fprintf(stderr, "[uccl_comm] rank=%d: IPC opened to rank %d (gpu %d)\n",
+                rank, r, ri.gpu_idx);
+      } else {
+        ri.gpu_buf = nullptr;  // inter-node, use fabric
+      }
+    }
+  }
 
   int node_idx = rank / num_local;
 
@@ -353,39 +401,47 @@ int uccl_alltoall(uccl_comm_t comm,
                   const void* sendbuf, void* recvbuf, size_t sendcount) {
   if (!comm) return -1;
 
-#ifdef USE_LIBFABRIC
-  if (!comm->cpu_ctx_initialized) return -1;
-
   int rank = comm->rank;
   int nranks = comm->nranks;
 
-  // Each rank writes sendcount bytes to every other rank.
-  // Data from rank r lands at offset r * sendcount in recvbuf.
+  // Phase 1: Intra-node via NVLink (cudaMemcpyAsync through IPC pointers).
   for (int dst = 0; dst < nranks; dst++) {
     if (dst == rank) continue;
-    int channel = dst % kChannelPerProxy;
-    size_t remote_offset = rank * sendcount;
-    // sendbuf is the local data; remote_offset tells where to put it
-    // in the destination's recvbuf.
-    // NOTE: recvbuf base address was registered during init; remote_offset
-    // is relative to the registered GPU buffer base.
-    int ret = fabric_write_with_data(
-        comm->cpu_fabric_ctx, channel,
-        const_cast<void*>(sendbuf), sendcount,
-        dst, remote_offset,
-        0, nullptr, true);
-    if (ret) return ret;
+    if (!comm->rank_info[dst].is_same_node) continue;
+    void* dst_ptr = (char*)comm->rank_info[dst].gpu_buf + rank * sendcount;
+    cudaMemcpyAsync(dst_ptr, sendbuf, sendcount, cudaMemcpyDeviceToDevice,
+                    comm->copy_stream);
   }
 
-  // Wait for local completions.
-  uccl_quiet(comm);
+#ifdef USE_LIBFABRIC
+  // Phase 2: Inter-node via CXI (fi_write, same as before).
+  if (comm->cpu_ctx_initialized) {
+    int remote_count = 0;
+    for (int dst = 0; dst < nranks; dst++) {
+      if (dst == rank) continue;
+      if (comm->rank_info[dst].is_same_node) continue;
+      int channel = dst % kChannelPerProxy;
+      int ret = fabric_write_with_data(
+          comm->cpu_fabric_ctx, channel,
+          const_cast<void*>(sendbuf), sendcount,
+          dst, rank * sendcount,
+          0, (void*)(uint64_t)(dst + 1), true);
+      if (ret) return ret;
+      remote_count++;
+    }
 
-  // Global barrier to ensure all writes are visible.
+    if (remote_count > 0) {
+      std::unordered_set<uint64_t> acked;
+      while ((int)acked.size() < remote_count) {
+        fabric_poll_tx(comm->cpu_fabric_ctx, acked);
+      }
+    }
+  }
+#endif
+
+  cudaStreamSynchronize(comm->copy_stream);
   MPI_Barrier(comm->mpi_comm);
   return 0;
-#else
-  return -1;
-#endif
 }
 
 // --------------------------------------------------------------------------
