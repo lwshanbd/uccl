@@ -109,3 +109,10 @@ ep/deep_ep_wrapper/deep_ep.egg-info/
 worktrees/
 *.csv
 *.egg-info/
+
+reference/
+
+# Polaris-specific PBS scripts, logs, and test binaries
+ep/tests/polaris/
+ep/tests/*.OU
+*.polaris-pbs-*

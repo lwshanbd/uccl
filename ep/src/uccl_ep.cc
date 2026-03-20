@@ -1561,7 +1561,7 @@ NB_MODULE(ep, m) {
   m.def(
       "can_register_rdma_gpu_buffer",
       [](int device_index, std::size_t num_bytes) {
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || defined(EFA)
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || defined(EFA) || defined(USE_LIBFABRIC)
         return true;
 #else
         CUDA_CHECK(cudaSetDevice(device_index));
@@ -1577,7 +1577,7 @@ NB_MODULE(ep, m) {
   m.def(
       "rdma_buffer_should_use_host_alloc",
       [](int device_index, std::size_t num_bytes) {
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || defined(EFA)
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || defined(EFA) || defined(USE_LIBFABRIC)
         return false;
 #else
         CUDA_CHECK(cudaSetDevice(device_index));

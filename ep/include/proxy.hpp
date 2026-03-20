@@ -3,7 +3,10 @@
 
 #include "common.hpp"
 #include "proxy_ctx.hpp"
-#include "rdma.hpp"
+#include "rdma.hpp"          // transport-independent: ImmType, AtomicsImm, etc.
+#ifdef USE_LIBFABRIC
+#include "fabric.hpp"
+#endif
 #include "ring_buffer.cuh"
 #include "util/gpu_rt.h"
 #include <algorithm>
@@ -103,7 +106,6 @@ class Proxy {
   void barrier_check();
   void quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds);
   void quiet_cq();
-  RDMAConnectionInfo local_info_{}, remote_info_{};
 
   // Reuse across multiple calls to avoid reallocations
   std::vector<uint64_t> wrs_to_post;
@@ -127,12 +129,19 @@ class Proxy {
   int listen_port_;
 
   std::vector<PeerMeta> peers_;
-  std::vector<std::unique_ptr<ProxyCtx>> ctxs_for_all_ranks_;
-  std::vector<RDMAConnectionInfo> local_infos_, remote_infos_;
-  std::vector<ProxyCtx*> ctx_by_tag_;
   void* atomic_buffer_ptr_;
   std::vector<TransferCmd> postponed_atomics_;
   std::vector<uint64_t> postponed_wr_ids_;
+
+#ifdef USE_LIBFABRIC
+  FabricCtx fabric_ctx_;
+  std::vector<FabricConnectionInfo> local_fabric_infos_, remote_fabric_infos_;
+#else
+  RDMAConnectionInfo local_info_{}, remote_info_{};
+  std::vector<std::unique_ptr<ProxyCtx>> ctxs_for_all_ranks_;
+  std::vector<RDMAConnectionInfo> local_infos_, remote_infos_;
+  std::vector<ProxyCtx*> ctx_by_tag_;
+#endif
 
 #ifdef USE_MSCCLPP_FIFO_BACKEND
   std::vector<uint64_t> fifo_seq_;

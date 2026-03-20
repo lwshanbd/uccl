@@ -1,6 +1,8 @@
 #pragma once
 #include "exception.cuh"
+#ifndef USE_LIBFABRIC
 #include <infiniband/verbs.h>
+#endif
 #include <chrono>
 #include <string>
 #include <thread>
@@ -40,6 +42,7 @@
   } while (0)
 #endif
 
+#ifndef USE_LIBFABRIC
 inline void drain_cq(ibv_cq* cq, int empty_rounds_target = 5) {
   if (!cq) return;
   int empty_rounds = 0;
@@ -73,3 +76,4 @@ inline void qp_to_error(ibv_qp* qp) {
     fprintf(stderr, "[destroy] ibv_modify_qp->ERR failed (ret=%d)\n", ret);
   }
 }
+#endif  // !USE_LIBFABRIC

@@ -1,8 +1,10 @@
 #include "proxy.hpp"
-#include "bench_utils.hpp"
 #include "d2h_queue_host.hpp"
 #include "ep_util.hpp"
+#ifndef USE_LIBFABRIC
+#include "bench_utils.hpp"
 #include "util/util.h"
+#endif
 #include <arpa/inet.h>  // for htonl, ntohl
 #include <chrono>
 #include <cstdlib>
@@ -78,9 +80,34 @@ void unmap_local_barrier_shm(std::string const& name, LocalBarrier* lb,
 }
 #endif
 
+// Standalone listen socket creation (avoids pulling in util/util.h under
+// USE_LIBFABRIC where <filesystem> and <infiniband/verbs.h> are unavailable).
+static uint16_t create_listen_socket_local(int* fd) {
+  *fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (*fd < 0) { perror("socket"); std::abort(); }
+  int flag = 1;
+  setsockopt(*fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(int));
+  struct sockaddr_in sa{};
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = INADDR_ANY;
+  sa.sin_port = htons(0);
+  if (bind(*fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+    perror("bind"); std::abort();
+  }
+  socklen_t len = sizeof(sa);
+  getsockname(*fd, (struct sockaddr*)&sa, &len);
+  uint16_t port = ntohs(sa.sin_port);
+  if (listen(*fd, 128) < 0) { perror("listen"); std::abort(); }
+  return port;
+}
+
 Proxy::Proxy(Config const& cfg) : cfg_(cfg) {
   // Initialize state tracking for each ring buffer
+#ifdef USE_LIBFABRIC
+  listen_port_ = create_listen_socket_local(&listen_fd_);
+#else
   listen_port_ = uccl::create_listen_socket(&listen_fd_);
+#endif
 #ifndef USE_MSCCLPP_FIFO_BACKEND
   ring_tails_.resize(cfg_.d2h_queues.size(), 0);
   ring_seen_.resize(cfg_.d2h_queues.size(), 0);
@@ -118,7 +145,12 @@ void Proxy::pin_thread_to_cpu_wrapper() {
 
 void Proxy::pin_thread_to_numa_wrapper() {
   if (cfg_.pin_thread) {
-    assert(ctx_.numa_node != -1);
+    if (ctx_.numa_node == -1) {
+      fprintf(stderr,
+              "[Proxy] NUMA node unknown, skipping thread pinning "
+              "(thread_idx=%d)\n", cfg_.thread_idx);
+      return;
+    }
     pin_thread_unique(ctx_.numa_node, cfg_.local_rank, cfg_.thread_idx,
                       kNumProxyThs);
 
@@ -144,11 +176,13 @@ void Proxy::set_peers_meta(std::vector<PeerMeta> const& peers) {
   for (auto const& p : peers) {
     peers_.push_back(p);
   }
+#ifndef USE_LIBFABRIC
   ctxs_for_all_ranks_.clear();
   ctxs_for_all_ranks_.resize(peers.size());
   for (size_t i = 0; i < peers.size(); ++i) {
     ctxs_for_all_ranks_[i] = std::make_unique<ProxyCtx>();
   }
+#endif
 }
 
 void Proxy::set_bench_d2h_channel_addrs(std::vector<uintptr_t> const& addrs) {
@@ -168,6 +202,10 @@ void Proxy::set_bench_d2h_channel_addrs(std::vector<uintptr_t> const& addrs) {
     cfg_.d2h_queues.push_back(h);
   }
 }
+
+#ifdef USE_LIBFABRIC
+// Libfabric implementations are in proxy_fabric.cpp, included at end of file.
+#else  // ibverbs path
 
 void Proxy::init_common() {
   int const my_rank = cfg_.rank;
@@ -542,6 +580,10 @@ void Proxy::run_dual() {
   }
 }
 
+#endif  // !USE_LIBFABRIC (end of ibverbs run_sender/run_remote/run_dual)
+
+// ---- Transport-independent functions ----
+
 void Proxy::notify_gpu_completion(uint64_t& my_tail) {
   if (acked_wrs_.empty()) return;
 
@@ -855,6 +897,11 @@ void Proxy::run_local() {
   printf("Local thread %d finished %d commands across %zu ring buffers\n",
          cfg_.thread_idx, total_seen, cfg_.d2h_queues.size());
 }
+
+// ---- End transport-independent functions ----
+
+#ifndef USE_LIBFABRIC
+// ---- ibverbs-specific: post_gpu_commands_mixed, quiet, destroy, barrier_msg ----
 
 void Proxy::post_gpu_commands_mixed(
     std::vector<uint64_t> const& wrs_to_post,
@@ -1237,8 +1284,10 @@ void Proxy::post_barrier_msg(int dst_rank, bool ack, uint64_t seq) {
       fprintf(stderr, "  bad wr_id=%llu\n", (unsigned long long)bad->wr_id);
     std::abort();
   }
-#endif
+#endif  // EFA
 }
+
+#endif  // !USE_LIBFABRIC (end of ibverbs-specific function implementations)
 
 void Proxy::send_barrier(uint64_t wr) {
 #ifndef USE_MSCCLPP_FIFO_BACKEND
@@ -1279,7 +1328,7 @@ void Proxy::barrier_check() {
       // Global leader: mark self-arrival; remote arrivals will come via
       // your existing CQ handler.
       if (ctx_.barrier_arrived.empty()) {
-        ctx_.barrier_arrived.assign(ctxs_for_all_ranks_.size(), 0);
+        ctx_.barrier_arrived.assign(peers_.size(), 0);
         ctx_.barrier_arrival_count = 0;
       }
       if (!ctx_.barrier_arrived[0]) {
@@ -1364,7 +1413,7 @@ void Proxy::barrier_check() {
           // Global leader: mark self-arrival; remote arrivals will come via
           // your existing CQ handler.
           if (ctx_.barrier_arrived.empty()) {
-            ctx_.barrier_arrived.assign(ctxs_for_all_ranks_.size(), 0);
+            ctx_.barrier_arrived.assign(peers_.size(), 0);
             ctx_.barrier_arrival_count = 0;
           }
           if (!ctx_.barrier_arrived[0]) {
@@ -1440,4 +1489,8 @@ void Proxy::barrier_check() {
 #endif
   }
 }
+#endif  // USE_SUBSET_BARRIER
+
+#ifdef USE_LIBFABRIC
+#include "proxy_fabric.cpp"
 #endif

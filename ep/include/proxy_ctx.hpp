@@ -1,4 +1,10 @@
 #pragma once
+
+#ifdef USE_LIBFABRIC
+// When building with libfabric, ProxyCtx is defined in fabric_ctx.hpp.
+#include "fabric_ctx.hpp"
+#else  // ibverbs path
+
 #include "barrier_local.hpp"
 #include "util/gpu_rt.h"
 #include <infiniband/verbs.h>
@@ -231,3 +237,5 @@ struct ProxyCtx {
 inline ibv_cq* get_cq(ProxyCtx& S) {
   return S.cq_ex ? ibv_cq_ex_to_cq(S.cq_ex) : S.cq;
 }
+
+#endif  // USE_LIBFABRIC

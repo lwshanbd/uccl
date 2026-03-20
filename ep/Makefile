@@ -2,6 +2,22 @@ CUDA_PATH ?= /usr/local/cuda
 override CXX := /usr/bin/g++
 NVCC      := $(CUDA_PATH)/bin/nvcc
 
+# --- Transport backend selection ---
+# Set USE_LIBFABRIC=1 to build with libfabric/CXI instead of ibverbs.
+USE_LIBFABRIC ?= 0
+
+ifeq ($(USE_LIBFABRIC),1)
+  FABRIC_HOME ?= /opt/cray/libfabric/2.2.0rc1
+  FABRIC_CFLAGS := -DUSE_LIBFABRIC -I$(FABRIC_HOME)/include
+  FABRIC_LDFLAGS := -L$(FABRIC_HOME)/lib64 -lfabric -Wl,-rpath,$(FABRIC_HOME)/lib64
+  $(info Building with libfabric (CXI) from $(FABRIC_HOME))
+  # No EFA/ibverbs when using libfabric
+  EFA_CFLAGS :=
+  EFA_LDFLAGS :=
+else
+  FABRIC_CFLAGS :=
+  FABRIC_LDFLAGS :=
+
 EFA_HOME?=/opt/amazon/efa
 ifeq ($(wildcard $(EFA_HOME)),)
   $(warning EFA not detected, building without EFA)
@@ -11,6 +27,7 @@ else
   $(info EFA detected, building with EFA)
   EFA_CFLAGS := -DEFA -I$(EFA_HOME)/include
   EFA_LDFLAGS := -L$(EFA_HOME)/lib -lefa
+endif
 endif
 
 ARCH := $(shell uname -m)
@@ -67,7 +84,11 @@ DETECTED_SM := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 
 SM ?= $(DETECTED_SM)
 
 CXXFLAGS  := -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D_GLIBCXX_USE_CXX11_ABI=$(TORCH_ABI)
+ifeq ($(USE_LIBFABRIC),1)
+LDFLAGS := -lpthread $(FABRIC_LDFLAGS) -lnuma -Xlinker -rpath -Xlinker $(CUDA_PATH)/lib64
+else
 LDFLAGS := -lpthread  -libverbs -lnl-3 -lnl-route-3 -lnuma -Xlinker -rpath -Xlinker $(CUDA_PATH)/lib64
+endif
 NVCCFLAGS := -O3 -std=c++17 -Xcompiler "-Wall -pthread -fPIC -fvisibility=hidden" -ccbin /usr/bin/g++ --expt-relaxed-constexpr -D_GLIBCXX_USE_CXX11_ABI=$(TORCH_ABI)
 INCLUDES := -Iinclude -I$(CUDA_PATH)/include -I/usr/include -I../include 
 
@@ -84,12 +105,16 @@ ifeq ($(PER_EXPERT_BATCHING),1)
   override NVCCFLAGS += -DPER_EXPERT_BATCHING
 endif
 
-CXXFLAGS  += $(EFA_CFLAGS) $(GH_CFLAGS) $(NORMAL_CFLAGS)
-NVCCFLAGS += $(EFA_CFLAGS) $(GH_CFLAGS) $(NORMAL_CFLAGS)
+CXXFLAGS  += $(EFA_CFLAGS) $(GH_CFLAGS) $(NORMAL_CFLAGS) $(FABRIC_CFLAGS)
+NVCCFLAGS += $(EFA_CFLAGS) $(GH_CFLAGS) $(NORMAL_CFLAGS) $(FABRIC_CFLAGS)
 LDFLAGS   += $(EFA_LDFLAGS)
-INCLUDES  += $(EFA_CFLAGS) $(GH_CFLAGS) $(NORMAL_CFLAGS)
+INCLUDES  += $(EFA_CFLAGS) $(GH_CFLAGS) $(NORMAL_CFLAGS) $(FABRIC_CFLAGS)
 
+ifeq ($(USE_LIBFABRIC),1)
+SRC_CPP := src/proxy.cpp src/fabric.cpp src/common.cpp src/uccl_proxy.cpp src/uccl_bench.cpp src/fifo.cpp
+else
 SRC_CPP := src/proxy.cpp src/rdma.cpp src/common.cpp src/uccl_proxy.cpp src/uccl_bench.cpp src/fifo.cpp
+endif
 SRC_CU  := src/bench_kernel.cu src/internode_ll.cu src/internode.cu src/layout.cu src/intranode.cu src/ep_runtime.cu
 
 OBJ_CPP := $(SRC_CPP:.cpp=.o)

@@ -6,7 +6,12 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#if __has_include(<numaif.h>)
 #include <numaif.h>
+#define HAS_NUMAIF 1
+#else
+#define HAS_NUMAIF 0
+#endif
 
 namespace mscclpp {
 
@@ -30,15 +35,15 @@ Fifo::Fifo(int size) {
   MSCCLPP_CUDATHROW(cudaGetDevice(&device));
   int numaNode = getDeviceNumaNode(device);
   if (numaNode >= 0) {
+#if HAS_NUMAIF
     unsigned long nodemask = 1UL << numaNode;
     if (set_mempolicy(MPOL_PREFERRED, &nodemask, 8 * sizeof(nodemask)) != 0) {
-      // Some containerized environments disallow set_mempolicy; continue
-      // without NUMA memory policy instead of failing proxy initialization.
       std::fprintf(stderr,
                    "Warning: set_mempolicy failed for device %d numaNode %d: "
                    "%s (errno=%d). Continuing without NUMA mempolicy.\n",
                    device, numaNode, std::strerror(errno), errno);
     }
+#endif
   }
   pimpl_ = std::make_unique<Impl>(size);
 }

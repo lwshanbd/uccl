@@ -2,6 +2,9 @@
 #include "common.hpp"
 #include "proxy_ctx.hpp"
 #include "rdma.hpp"
+#ifdef USE_LIBFABRIC
+#include "fabric.hpp"
+#endif
 #include "ring_buffer.cuh"
 #include <chrono>
 #include <cstdio>
@@ -68,6 +71,12 @@ UcclProxy::UcclProxy(int thread_idx, uintptr_t gpu_buffer_addr,
     // EFA: atomic buffer is always pinned host memory (cudaHostAlloc).
     cudaHostAlloc(&atomic_buffer_ptr_, kAtomicBufferSize,
                   cudaHostAllocMapped | cudaHostAllocWriteCombined);
+    atomic_buffer_is_host_allocated_ = true;
+#elif defined(USE_LIBFABRIC)
+    // Libfabric/CXI with FI_HMEM: use pinned host memory for the atomic
+    // buffer so the CPU proxy can do std::atomic ops on it directly.
+    cudaHostAlloc(&atomic_buffer_ptr_, kAtomicBufferSize,
+                  cudaHostAllocMapped);
     atomic_buffer_is_host_allocated_ = true;
 #else
     // Dynamically detect: on some nodes (e.g. GH10) ibv_reg_mr fails for
@@ -267,8 +276,12 @@ void FifoProxy::run_sender() {
   while (!stop_flag_.load(std::memory_order_acquire) &&
          proxy_->ctx_.progress_run.load(std::memory_order_acquire)) {
     // Poll completions (like original proxy)
+#ifdef USE_LIBFABRIC
+    fabric_poll_tx(proxy_->fabric_ctx_, proxy_->acked_wrs_);
+#else
     local_poll_completions(proxy_->ctx_, proxy_->acked_wrs_, thread_idx,
                            proxy_->ctx_by_tag_);
+#endif
 
     // Process completed work requests (similar to notify_gpu_completion)
     while (fifo_tail_acked < fifo_head_seen &&
@@ -336,8 +349,12 @@ void FifoProxy::run_sender() {
 
   // Wait for all remaining completions
   while (fifo_tail_acked < fifo_head_seen) {
+#ifdef USE_LIBFABRIC
+    fabric_poll_tx(proxy_->fabric_ctx_, proxy_->acked_wrs_);
+#else
     local_poll_completions(proxy_->ctx_, proxy_->acked_wrs_, thread_idx,
                            proxy_->ctx_by_tag_);
+#endif
 
     while (fifo_tail_acked < fifo_head_seen &&
            proxy_->acked_wrs_.count(fifo_tail_acked) > 0) {
@@ -378,6 +395,10 @@ void FifoProxy::run_remote() {
 
   while (!stop_flag_.load(std::memory_order_acquire) &&
          proxy_->ctx_.progress_run.load(std::memory_order_acquire)) {
+#ifdef USE_LIBFABRIC
+    fi_cq_data_entry rx_entries[64];
+    fabric_poll_rx(proxy_->fabric_ctx_, rx_entries, 64);
+#else
     remote_poll_completions(proxy_->ctx_, thread_idx, proxy_->ring,
                             proxy_->ctx_by_tag_, proxy_->atomic_buffer_ptr_,
                             2,  // num_ranks (simplified for 2-node case)
@@ -386,6 +407,7 @@ void FifoProxy::run_remote() {
     apply_pending_updates(proxy_->ctx_, pending_atomic_updates,
                           proxy_->atomic_buffer_ptr_, 0,
                           2);  // num_experts=0, num_ranks=2
+#endif
   }
 
   std::cout << "[FifoProxy " << thread_idx << "] Remote stopped" << std::endl;

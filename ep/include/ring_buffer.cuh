@@ -3,7 +3,9 @@
 
 #include "common.hpp"
 #include "util/gpu_rt.h"
+#ifndef USE_LIBFABRIC
 #include <infiniband/verbs.h>
+#endif
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -274,9 +276,15 @@ struct alignas(128) RingBuffer {
   }
 
   /* TODO(MaoZiming) to refactor */
+#ifdef USE_LIBFABRIC
+  void* ack_qp = nullptr;   // unused under libfabric
+  void* ctx = nullptr;
+  void* ack_mr = nullptr;   // unused under libfabric
+#else
   struct ibv_qp* ack_qp = nullptr;
   void* ctx = nullptr;
   ibv_mr* ack_mr = nullptr;
+#endif
   uint64_t ack_buf[RECEIVER_BATCH_SIZE] = {0};
 
   inline void cpu_volatile_store_tail(uint64_t new_tail) {

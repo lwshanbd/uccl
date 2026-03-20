@@ -2,8 +2,24 @@
 #define RDMA_HPP
 #include "common.hpp"
 #include "proxy_ctx.hpp"
+
+// Transport-independent immediate-data encoding (used by both ibverbs and
+// libfabric backends).  Placed before the #ifdef so that all backends can
+// use ImmType / AtomicsImm / WriteImm / BarrierImm / PendingUpdate.
+
+#include <atomic>
+#include <cassert>
+#include <set>
+#include <tuple>
+#include <vector>
+
+#ifndef USE_LIBFABRIC
+// Forward-declare CopyRingBuffer only for the ibverbs path where
+// ring_buffer.cuh is included below.  Under USE_LIBFABRIC the typedef
+// comes from fabric.hpp -> ring_buffer.cuh which is included first.
+class CopyRingBuffer;
+// ---- ibverbs-specific includes and types ----
 // clang-format off
-// prevent clang-format reordering net.h before util.h
 #include "util/util.h"
 #include "util/net.h"
 // clang-format on
@@ -13,13 +29,8 @@
 #include <infiniband/efadv.h>
 #endif
 #include <infiniband/verbs.h>
-#include <atomic>
-#include <cassert>
 #include <mutex>
-#include <set>
-#include <tuple>
 #include <unordered_set>
-#include <vector>
 
 struct RDMAConnectionInfo {
   uint32_t qp_num;  // Queue pair number
@@ -55,6 +66,7 @@ struct RDMAConnectionInfo {
   } mr_chunk_info[kMaxMRChunks];
 #endif
 };
+#endif  // !USE_LIBFABRIC  (end of RDMAConnectionInfo and ibverbs-only types)
 
 struct PendingUpdate {
   std::atomic<int64_t>* addr;
@@ -324,6 +336,9 @@ struct BarrierImm {
   uint32_t value;
 };
 
+#ifndef USE_LIBFABRIC
+// ---- ibverbs function declarations ----
+
 // Setup RDMA resources (register GPU memory, create QP, etc.)
 void setup_rdma(void* gpu_buffer, size_t size, RDMAConnectionInfo* local_info,
                 int rank);
@@ -426,5 +441,7 @@ void apply_pending_updates(ProxyCtx& ctx,
                            void* atomic_buffer_ptr, int num_experts,
                            int num_ranks);
 int poll_cq_once(ibv_cq* cq, ibv_wc* wc, int max_cqes);
+
+#endif  // !USE_LIBFABRIC  (end of ibverbs function declarations)
 
 #endif  // RDMA_HPP
