@@ -467,9 +467,12 @@ typedef RingBuffer<CopyTask, FlowDirection::HostToHost, COPY_RING_CAP>
 
 static inline uintptr_t alloc_cmd_ring() {
   void* raw = nullptr;
-  auto err = cudaMallocHost(&raw, sizeof(DeviceToHostCmdBuffer));
+  // Use cudaHostAllocMapped so the buffer is accessible from both CPU proxy
+  // threads and GPU kernels (GPU-initiated D2H command push).
+  auto err = cudaHostAlloc(&raw, sizeof(DeviceToHostCmdBuffer),
+                           cudaHostAllocMapped);
   if (err != cudaSuccess || raw == nullptr) {
-    throw std::runtime_error("cudaMallocHost(DeviceToHostCmdBuffer) failed");
+    throw std::runtime_error("cudaHostAlloc(DeviceToHostCmdBuffer) failed");
   }
   auto* rb = static_cast<DeviceToHostCmdBuffer*>(raw);
   new (rb) DeviceToHostCmdBuffer{};

@@ -16,7 +16,8 @@ class UcclProxy {
             int rank, int node_idx, int local_rank, int num_experts = 0,
             int num_ranks = 0, int num_nodes = 0, bool use_normal_mode = false,
             bool is_intranode = false,
-            bool gpu_buffer_is_host_allocated = false);
+            bool gpu_buffer_is_host_allocated = false,
+            bool defer_ring_alloc = false);
   ~UcclProxy();
 
   void start_sender();
@@ -70,6 +71,115 @@ class UcclProxy {
   std::vector<uint64_t> get_d2h_channel_addrs() const;
   int thread_idx() const noexcept { return thread_idx_; }
   void* gpu_buffer_addr() const noexcept { return gpu_buffer_addr_; }
+
+  // Prevent stop()/destroy() from freeing the GPU buffer.  Use when the
+  // caller (e.g. uccl_comm) owns the buffer lifetime.
+  void release_gpu_buffer() { proxy_->cfg_.gpu_buffer = nullptr; }
+
+  // Access the underlying Proxy for direct method calls (e.g. MPI-based
+  // init_fabric_insert_peers).
+  Proxy* proxy_access() { return proxy_.get(); }
+
+#ifdef USE_LIBFABRIC
+  // MPI-based init (no TCP).  All fabric operations (init, insert_peers,
+  // polling) run on a SINGLE thread to satisfy CXI HMEM's requirement
+  // that CUDA context and DMA ops share the same thread.
+  //
+  // The proxy thread does:
+  //   1. fabric_init → write local_info → set init_done
+  //   2. spin-wait for peers_done
+  //   3. post recvs → enter polling loop
+  //
+  // The main thread does:
+  //   1. spin-wait for init_done
+  //   2. MPI_Allgather → insert_peers → set peers_done
+
+  // Shared state for handshake (set by caller before start).
+  FabricConnectionInfo* mpi_local_info_out = nullptr;
+  std::vector<FabricConnectionInfo> const* mpi_remote_infos = nullptr;
+  int mpi_num_ranks = 0;
+  std::atomic<bool> init_done{false};
+  std::atomic<bool> peers_done{false};
+
+  // Start the proxy thread.  It will do fabric_init, then wait for
+  // the main thread to signal peers_done before entering the poll loop.
+  void start_mpi_init() {
+    proxy_->set_progress_run(true);
+    running_.store(true, std::memory_order_release);
+    thread_ = std::thread([this]() {
+      // Phase 1: fabric_init on this thread (NUMA + CUDA context).
+      proxy_->init_fabric_local(*mpi_local_info_out);
+      init_done.store(true, std::memory_order_release);
+
+      // Phase 2: wait for main thread to exchange info and insert peers.
+      while (!peers_done.load(std::memory_order_acquire)) {
+        cpu_relax();
+      }
+
+      // Phase 3: main thread already called insert_peers — post recvs
+      // and enter polling loop (all on THIS thread).
+      proxy_->run_dual_after_init();
+    });
+  }
+
+  void wait_fabric_init() {
+    while (!init_done.load(std::memory_order_acquire)) {
+      usleep(100);
+    }
+  }
+
+  void signal_peers_ready() {
+    peers_done.store(true, std::memory_order_release);
+  }
+#endif
+
+  // Re-allocate ring buffers and update the running proxy's D2H queues.
+  // Call AFTER all fabric_init() calls have completed (CXI fi_mr_regattr
+  // with FI_HMEM_CUDA invalidates pre-existing cudaHostAlloc/cudaMallocManaged
+  // registrations, so ring buffers must be allocated after fabric init).
+  void reinit_ring_buffers() {
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+    // FIFO backend: free old FIFOs and create new ones.
+    fifos.clear();
+    d2h_channel_addrs_.clear();
+    d2h_queues.clear();
+    d2h_queues.resize(kChannelPerProxy);
+
+    std::vector<d2hq::HostD2HHandle> new_handles;
+    new_handles.reserve(kChannelPerProxy);
+    for (size_t i = 0; i < kChannelPerProxy; ++i) {
+      auto fifo = std::make_unique<mscclpp::Fifo>(kQueueSize);
+      uintptr_t addr = reinterpret_cast<uintptr_t>(fifo.get());
+      d2hq::init_from_addr(d2h_queues[i], addr);
+      new_handles.push_back(d2h_queues[i]);
+      d2h_channel_addrs_.push_back(addr);
+      fifos.push_back(std::move(fifo));
+    }
+#else
+    // Ring buffer backend.
+    for (auto addr : d2h_channel_addrs_) {
+      free_cmd_ring(addr);
+    }
+    d2h_channel_addrs_.clear();
+    d2h_queues.clear();
+    d2h_queues.resize(kChannelPerProxy);
+
+    std::vector<d2hq::HostD2HHandle> new_handles;
+    new_handles.reserve(kChannelPerProxy);
+    for (size_t i = 0; i < kChannelPerProxy; ++i) {
+      uintptr_t addr = alloc_cmd_ring();
+      d2hq::init_from_addr(d2h_queues[i], addr);
+      new_handles.push_back(d2h_queues[i]);
+      d2h_channel_addrs_.push_back(addr);
+    }
+#endif
+
+    fprintf(stderr, "[UcclProxy] reinit_ring_buffers: allocated %zu queues\n",
+            d2h_channel_addrs_.size());
+
+    // Update the running proxy (thread-safe via atomic flag).
+    proxy_->update_d2h_queues(new_handles);
+  }
   double avg_rdma_write_us() const { return proxy_->avg_rdma_write_us(); }
   double avg_wr_latency_us() const { return proxy_->avg_wr_latency_us(); }
   void set_peers_meta(std::vector<PeerMeta> const& peers);

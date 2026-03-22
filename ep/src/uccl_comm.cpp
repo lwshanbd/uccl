@@ -187,10 +187,7 @@ int uccl_comm_init_mpi(uccl_comm_t* out_comm, void* mpi_comm_ptr,
 
   int node_idx = rank / num_local;
 
-  // Skip proxy threads for now — use cpu_fabric_ctx for direct communication.
-  // TODO: re-enable proxy threads after resolving CUDA context + HMEM
-  // interaction on multi-node.
-  int num_proxies = 0;
+  int num_proxies = kNumProxyThs;
   for (int t = 0; t < num_proxies; t++) {
     auto proxy = std::make_unique<UcclProxy>(
         t,
@@ -200,38 +197,23 @@ int uccl_comm_init_mpi(uccl_comm_t* out_comm, void* mpi_comm_ptr,
         /*num_experts=*/0,
         /*num_ranks=*/nranks,
         /*num_nodes=*/num_nodes,
-        /*use_normal_mode=*/true,
+        /*use_normal_mode=*/false,
         /*is_intranode=*/false,
-        /*gpu_buffer_is_host_allocated=*/false);
+        /*gpu_buffer_is_host_allocated=*/false,
+        /*defer_ring_alloc=*/true);
     comm->proxies.push_back(std::move(proxy));
   }
 
-  // Collect D2H channel addresses from all proxies.
-  for (auto& proxy : comm->proxies) {
-    auto addrs = proxy->get_d2h_channel_addrs();
-    for (auto a : addrs) {
-      comm->d2h_addrs.push_back(a);
-    }
-  }
-
-  // Exchange peer metadata via MPI.
-  // Each rank collects: IP, listen ports, GPU buffer ptr, size.
+  // Build PeerMeta (IP + GPU ptr) for each rank — no listen_ports needed
+  // since we use MPI for connection exchange instead of TCP.
   struct RankMeta {
     char ip[256];
-    int listen_ports[kNumProxyThs];
     uintptr_t gpu_ptr;
     size_t gpu_size;
   };
 
   RankMeta my_meta{};
   strncpy(my_meta.ip, hostname, sizeof(my_meta.ip) - 1);
-  for (int t = 0; t < kNumProxyThs; t++) {
-    if (t < (int)comm->proxies.size()) {
-      my_meta.listen_ports[t] = comm->proxies[t]->get_listen_port();
-    } else {
-      my_meta.listen_ports[t] = 0;
-    }
-  }
   my_meta.gpu_ptr = reinterpret_cast<uintptr_t>(gpu_buf);
   my_meta.gpu_size = gpu_buf_size;
 
@@ -239,16 +221,14 @@ int uccl_comm_init_mpi(uccl_comm_t* out_comm, void* mpi_comm_ptr,
   MPI_Allgather(&my_meta, sizeof(RankMeta), MPI_BYTE,
                 all_meta.data(), sizeof(RankMeta), MPI_BYTE, mpi_comm);
 
-  // Build PeerMeta list and set on all proxies.
   std::vector<PeerMeta> peers(nranks);
   for (int r = 0; r < nranks; r++) {
     peers[r].rank = r;
     peers[r].ptr = all_meta[r].gpu_ptr;
     peers[r].nbytes = all_meta[r].gpu_size;
     peers[r].ip = std::string(all_meta[r].ip);
-    for (int t = 0; t < kNumProxyThs; t++) {
-      peers[r].listen_ports[t] = all_meta[r].listen_ports[t];
-    }
+    // listen_ports unused (MPI exchange, no TCP).
+    memset(peers[r].listen_ports, 0, sizeof(peers[r].listen_ports));
   }
 
   // Share atomic buffer pointer across proxies.
@@ -260,30 +240,73 @@ int uccl_comm_init_mpi(uccl_comm_t* out_comm, void* mpi_comm_ptr,
         proxy->set_atomic_buffer_ptr(atomic_ptr);
       }
     }
-
     for (auto& proxy : comm->proxies) {
       proxy->set_peers_meta(peers);
     }
   }
 
-  MPI_Barrier(mpi_comm);
-
-  // Start proxy threads in dual mode (send + receive).
-  for (auto& proxy : comm->proxies) {
-    proxy->start_dual();
+  // ---- MPI-based proxy init (no TCP) ----
+  //
+  // All fabric operations (init, insert_peers, polling) run on a SINGLE
+  // proxy thread to satisfy CXI HMEM's requirement that the CUDA context
+  // and DMA ops share the same thread.
+  //
+  // Step 1: launch proxy threads — each does fabric_init then waits.
+  std::vector<FabricConnectionInfo> local_infos(num_proxies);
+  for (int t = 0; t < num_proxies; t++) {
+    auto& p = comm->proxies[t];
+    p->mpi_local_info_out = &local_infos[t];
+    p->mpi_num_ranks = nranks;
+    p->start_mpi_init();
   }
 
-  if (!comm->proxies.empty()) {
-    sleep(3);
+  // Step 2: wait for all proxy threads to finish fabric_init.
+  for (int t = 0; t < num_proxies; t++) {
+    comm->proxies[t]->wait_fabric_init();
   }
-  MPI_Barrier(mpi_comm);
+
+  // Step 3: MPI_Allgather to exchange FabricConnectionInfo.
+  int infos_per_rank = num_proxies;
+  std::vector<FabricConnectionInfo> all_infos(nranks * infos_per_rank);
+  MPI_Allgather(local_infos.data(),
+                infos_per_rank * sizeof(FabricConnectionInfo), MPI_BYTE,
+                all_infos.data(),
+                infos_per_rank * sizeof(FabricConnectionInfo), MPI_BYTE,
+                mpi_comm);
+
+  // Step 4: insert peers into each proxy's fabric context.
+  //         This is called on the main thread but only writes to data
+  //         structures; the proxy thread is spin-waiting and not touching
+  //         these fields.
+  for (int t = 0; t < num_proxies; t++) {
+    std::vector<FabricConnectionInfo> remote_for_t(nranks);
+    for (int r = 0; r < nranks; r++) {
+      remote_for_t[r] = all_infos[r * infos_per_rank + t];
+    }
+    comm->proxies[t]->proxy_access()->init_fabric_insert_peers(
+        nranks, remote_for_t);
+  }
+
+  // Step 5: allocate ring buffers AFTER all fabric_init calls (CXI HMEM
+  //         invalidates pre-existing cudaHostAlloc registrations).
+  comm->d2h_addrs.clear();
+  for (int t = 0; t < num_proxies; t++) {
+    comm->proxies[t]->reinit_ring_buffers();
+    auto addrs = comm->proxies[t]->get_d2h_channel_addrs();
+    for (auto a : addrs) {
+      comm->d2h_addrs.push_back(a);
+    }
+  }
+
+  // Step 6: signal proxy threads to enter polling loop.
+  for (int t = 0; t < num_proxies; t++) {
+    comm->proxies[t]->signal_peers_ready();
+  }
 
   fprintf(stderr,
-          "[uccl_comm] rank=%d: initialized %zu proxy threads, "
-          "%zu D2H channels\n",
-          rank, comm->proxies.size(), comm->d2h_addrs.size());
-
-  // cpu_fabric_ctx already initialized above.
+          "[uccl_comm] rank=%d: initialized %d proxy threads, "
+          "%zu D2H channels (MPI exchange, no TCP)\n",
+          rank, num_proxies, comm->d2h_addrs.size());
 
   MPI_Barrier(mpi_comm);
   *out_comm = comm;
@@ -297,8 +320,10 @@ int uccl_comm_init_mpi(uccl_comm_t* out_comm, void* mpi_comm_ptr,
 int uccl_comm_destroy(uccl_comm_t comm) {
   if (!comm) return -1;
 
-  // Stop proxy threads.
+  // Stop proxy threads.  Caller owns the GPU buffer, so release it
+  // from the proxies first to prevent double-free.
   for (auto& proxy : comm->proxies) {
+    proxy->release_gpu_buffer();
     proxy->stop();
   }
   comm->proxies.clear();

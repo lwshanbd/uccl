@@ -115,7 +115,7 @@ SRC_CPP := src/proxy.cpp src/fabric.cpp src/common.cpp src/uccl_proxy.cpp src/uc
 else
 SRC_CPP := src/proxy.cpp src/rdma.cpp src/common.cpp src/uccl_proxy.cpp src/uccl_bench.cpp src/fifo.cpp
 endif
-SRC_CU  := src/bench_kernel.cu src/internode_ll.cu src/internode.cu src/layout.cu src/intranode.cu src/ep_runtime.cu
+SRC_CU  := src/bench_kernel.cu src/gpu_write_kernel.cu src/internode_ll.cu src/internode.cu src/layout.cu src/intranode.cu src/ep_runtime.cu
 
 OBJ_CPP := $(SRC_CPP:.cpp=.o)
 OBJ_CU  := $(SRC_CU:.cu=.o)
@@ -125,7 +125,7 @@ OBJ_BIND := $(SRC_BIND:.cc=.o)
 EP_EXT  := ep$(EXT_SUFFIX)
 PYTARGET      := ep$(EXT_SUFFIX)
 
-.PHONY: all py clean
+.PHONY: all py clean tests
 
 all: $(EP_EXT)
 
@@ -168,10 +168,54 @@ install: $(EP_EXT)
 		echo "Installed $(EP_EXT) -> $(UCCL_UCCL)/ (for in-repo runs)"; \
 	fi
 
+# ---------------------------------------------------------------------------
+# Test targets (standalone executables, linked with MPI)
+# ---------------------------------------------------------------------------
+
+# Object files needed by tests (subset of the main library objects).
+TEST_OBJ_CPP := $(OBJ_CPP)
+TEST_OBJ_CU  := $(OBJ_CU)
+TEST_LDFLAGS := -L$(CUDA_PATH)/lib64 -Wl,-rpath,$(CUDA_PATH)/lib64 \
+                -lcuda -lcudart $(LDFLAGS)
+
+# uccl_comm objects (always compiled with fabric flags etc.)
+src/uccl_comm.o: src/uccl_comm.cpp
+	$(CXX) $(CXXFLAGS) $(TORCH_INCS) $(INCLUDES) -MMD -MP -c $< -o $@
+
+tests/test_gpu_proxy_fabric.o: tests/test_gpu_proxy_fabric.cpp
+	$(CXX) $(CXXFLAGS) $(TORCH_INCS) $(INCLUDES) -MMD -MP -c $< -o $@
+
+test_gpu_proxy_fabric: tests/test_gpu_proxy_fabric.o src/uccl_comm.o $(TEST_OBJ_CPP) $(TEST_OBJ_CU)
+	$(CXX) $(CXXFLAGS) $^ \
+	    -L$(TORCH_LIBDIR) -Wl,-rpath,$(TORCH_LIBDIR) \
+	    -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda \
+	    $(TEST_LDFLAGS) -o $@
+
+tests/test_uccl_comm.o: tests/test_uccl_comm.cpp
+	$(CXX) $(CXXFLAGS) $(TORCH_INCS) $(INCLUDES) -MMD -MP -c $< -o $@
+
+test_uccl_comm: tests/test_uccl_comm.o src/uccl_comm.o $(TEST_OBJ_CPP) $(TEST_OBJ_CU)
+	$(CXX) $(CXXFLAGS) $^ \
+	    -L$(TORCH_LIBDIR) -Wl,-rpath,$(TORCH_LIBDIR) \
+	    -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda \
+	    $(TEST_LDFLAGS) -o $@
+
+tests/test_fabric_alltoall_v2.o: tests/test_fabric_alltoall_v2.cpp
+	$(CXX) $(CXXFLAGS) $(TORCH_INCS) $(INCLUDES) -MMD -MP -c $< -o $@
+
+test_fabric_alltoall_v2: tests/test_fabric_alltoall_v2.o src/uccl_comm.o $(TEST_OBJ_CPP) $(TEST_OBJ_CU)
+	$(CXX) $(CXXFLAGS) $^ \
+	    -L$(TORCH_LIBDIR) -Wl,-rpath,$(TORCH_LIBDIR) \
+	    -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda \
+	    $(TEST_LDFLAGS) -o $@
+
+tests: test_gpu_proxy_fabric test_uccl_comm test_fabric_alltoall_v2
+
 # Clean all generated files
 clean:
 	rm -f $(OBJ_CPP) $(OBJ_CC) $(OBJ_CU) $(OBJ_BIND) $(NB_OBJECTS) \
-	      $(EP_EXT) \
+	      $(EP_EXT) src/uccl_comm.o \
+	      tests/*.o test_gpu_proxy_fabric test_uccl_comm test_fabric_alltoall_v2 \
 	      *.d src/*.d bench/*.d src/*.o **/*.hip **/*_hip.*
 
 # Automatically include dependency files if they exist

@@ -198,6 +198,14 @@ void Proxy::init_common() {
     fabric_post_recv(fabric_ctx_);
   }
 
+  // Close the listen socket — TCP OOB exchange is done.  Leaving it open
+  // can cause spurious connection attempts from other subsystems (MPI, CXI)
+  // to hit this socket and trigger retries / aborts.
+  if (listen_fd_ >= 0) {
+    close(listen_fd_);
+    listen_fd_ = -1;
+  }
+
   fprintf(stderr, "[Proxy-Fabric] rank=%d thread=%d: init_common complete\n",
           my_rank, cfg_.thread_idx);
 }
@@ -209,6 +217,146 @@ void Proxy::init_sender() {
 
 void Proxy::init_remote() {
   init_common();
+}
+
+// ---------------------------------------------------------------------------
+// MPI-based init: split init_common into phases
+// ---------------------------------------------------------------------------
+
+void Proxy::init_fabric_local(FabricConnectionInfo& out_local_info) {
+  int const my_rank = cfg_.rank;
+
+  // Initialize libfabric resources (same as first part of init_common).
+  fabric_init(fabric_ctx_, cfg_.gpu_buffer, cfg_.total_size,
+              atomic_buffer_ptr_, atomic_buffer_ptr_ ? kAtomicBufferSize : 0,
+              cfg_.local_rank, my_rank, cfg_.thread_idx, cfg_.local_rank);
+
+  ctx_.numa_node = fabric_ctx_.numa_node;
+  pin_thread_to_numa_wrapper();
+
+  // Get this thread's local connection info.
+  memset(&out_local_info, 0, sizeof(out_local_info));
+  fabric_get_local_info(fabric_ctx_, cfg_.gpu_buffer, cfg_.total_size,
+                        atomic_buffer_ptr_,
+                        atomic_buffer_ptr_ ? kAtomicBufferSize : 0,
+                        out_local_info);
+
+  fprintf(stderr,
+          "[Proxy-Fabric] rank=%d thread=%d: init_fabric_local complete\n",
+          my_rank, cfg_.thread_idx);
+}
+
+void Proxy::init_fabric_insert_peers(
+    int num_ranks,
+    std::vector<FabricConnectionInfo> const& remote_infos) {
+  int const my_rank = cfg_.rank;
+
+  fabric_ctx_.ctrl_peer_addrs.resize(num_ranks, FI_ADDR_UNSPEC);
+  fabric_ctx_.remote_info.resize(num_ranks);
+
+  for (int peer = 0; peer < num_ranks; ++peer) {
+    if (peer == my_rank) continue;
+    if (peers_[peer].ip == peers_[my_rank].ip) continue;
+    fabric_insert_peer(fabric_ctx_, peer, remote_infos[peer]);
+
+    fprintf(stderr,
+            "[Proxy-Fabric] rank=%d thread=%d: peer %d inserted "
+            "(gpu_key=0x%lx)\n",
+            my_rank, cfg_.thread_idx, peer,
+            (unsigned long)fabric_ctx_.remote_info[peer].gpu_key);
+  }
+}
+
+void Proxy::run_dual_after_init() {
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+  // Initialize FIFO state (normally done in init_common).
+  fifo_seq_.assign(cfg_.d2h_queues.size(), 0);
+  fifo_pending_.assign(cfg_.d2h_queues.size(),
+                       std::deque<std::pair<uint64_t, size_t>>{});
+#endif
+
+  fprintf(stderr,
+          "[Proxy-Fabric] rank=%d thread=%d: entering run_dual_after_init, "
+          "posting %d recvs\n",
+          cfg_.rank, cfg_.thread_idx, kMaxOutstandingRecvs);
+  fflush(stderr);
+
+  // Pre-post receive buffers for barrier/atomic messages.
+  for (int i = 0; i < kMaxOutstandingRecvs; i++) {
+    int ret = fabric_post_recv(fabric_ctx_);
+    if (ret && i < 3) {
+      fprintf(stderr, "[Proxy-Fabric] rank=%d thread=%d: fabric_post_recv[%d] "
+              "failed: %d\n", cfg_.rank, cfg_.thread_idx, i, ret);
+    }
+  }
+
+  int num_ranks = static_cast<int>(peers_.size());
+  fprintf(stderr,
+          "[Proxy-Fabric] rank=%d thread=%d: run_dual_after_init started "
+          "(num_ranks=%d, d2h_ready=%d, d2h_queues=%zu, "
+          "data_eps[0]=%p, ctrl_ep=%p)\n",
+          cfg_.rank, cfg_.thread_idx, num_ranks,
+          d2h_ready_.load(std::memory_order_relaxed),
+          cfg_.d2h_queues.size(),
+          (void*)fabric_ctx_.data_eps[0],
+          (void*)fabric_ctx_.ctrl_ep);
+
+  // Enter the polling loop (same as run_dual but without init_common).
+  uint64_t my_tail = 0;
+  size_t seen = 0;
+  fi_cq_data_entry rx_entries[64];
+  int loop_count = 0;
+  while (ctx_.progress_run.load(std::memory_order_acquire)) {
+    if (loop_count < 3 && cfg_.thread_idx == 0) {
+      fprintf(stderr, "[Proxy-Fabric] rank=%d thread=%d: poll loop iter %d\n",
+              cfg_.rank, cfg_.thread_idx, loop_count);
+      fflush(stderr);
+    }
+    loop_count++;
+
+    fabric_poll_tx(fabric_ctx_, acked_wrs_);
+
+    int ne = fabric_poll_rx(fabric_ctx_, rx_entries, 64);
+    for (int i = 0; i < ne; i++) {
+      uint32_t imm = (uint32_t)rx_entries[i].data;
+      if (rx_entries[i].flags & FI_REMOTE_CQ_DATA) {
+        if (ImmType::IsBarrier(imm)) {
+          BarrierImm b(imm);
+          if (b.GetIsAck()) {
+            ctx_.barrier_released = true;
+            ctx_.barrier_release_seq = b.GetSeq();
+          } else {
+            int src_node = b.GetRank();
+            if (ctx_.barrier_arrived.size() <=
+                static_cast<size_t>(src_node)) {
+              ctx_.barrier_arrived.resize(src_node + 1, 0);
+            }
+            if (!ctx_.barrier_arrived[src_node]) {
+              ctx_.barrier_arrived[src_node] = 1;
+              ++ctx_.barrier_arrival_count;
+            }
+          }
+        } else if (ImmType::IsAtomics(imm)) {
+          AtomicsImm a(imm);
+          if (atomic_buffer_ptr_) {
+            int off = a.GetOff();
+            int val = a.GetValue();
+            auto* p = reinterpret_cast<std::atomic<int64_t>*>(
+                static_cast<char*>(atomic_buffer_ptr_) + off * sizeof(int64_t));
+            p->fetch_add(val, std::memory_order_relaxed);
+          }
+        }
+        fabric_post_recv(fabric_ctx_);
+      }
+    }
+
+    notify_gpu_completion(my_tail);
+    post_gpu_command(my_tail, seen);
+
+    if (cfg_.use_normal_mode) {
+      barrier_check();
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +474,39 @@ void Proxy::run_dual() {
     if (cfg_.use_normal_mode) {
       barrier_check();
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// run_dual_poll_only — resume after pause (skip init_common)
+// ---------------------------------------------------------------------------
+void Proxy::run_dual_poll_only() {
+  uint64_t my_tail = 0;
+  size_t seen = 0;
+  fi_cq_data_entry rx_entries[64];
+  while (ctx_.progress_run.load(std::memory_order_acquire)) {
+    fabric_poll_tx(fabric_ctx_, acked_wrs_);
+
+    int ne = fabric_poll_rx(fabric_ctx_, rx_entries, 64);
+    for (int i = 0; i < ne; i++) {
+      uint32_t imm = (uint32_t)rx_entries[i].data;
+      if (rx_entries[i].flags & FI_REMOTE_CQ_DATA) {
+        if (ImmType::IsAtomics(imm)) {
+          AtomicsImm a(imm);
+          if (atomic_buffer_ptr_) {
+            int off = a.GetOff();
+            int val = a.GetValue();
+            auto* p = reinterpret_cast<std::atomic<int64_t>*>(
+                static_cast<char*>(atomic_buffer_ptr_) + off * sizeof(int64_t));
+            p->fetch_add(val, std::memory_order_relaxed);
+          }
+        }
+        fabric_post_recv(fabric_ctx_);
+      }
+    }
+
+    notify_gpu_completion(my_tail);
+    post_gpu_command(my_tail, seen);
   }
 }
 

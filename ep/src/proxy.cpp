@@ -112,6 +112,10 @@ Proxy::Proxy(Config const& cfg) : cfg_(cfg) {
   ring_tails_.resize(cfg_.d2h_queues.size(), 0);
   ring_seen_.resize(cfg_.d2h_queues.size(), 0);
 #endif
+  // If queues are already provided, mark as ready immediately.
+  if (!cfg_.d2h_queues.empty()) {
+    d2h_ready_.store(true, std::memory_order_release);
+  }
 }
 
 double Proxy::avg_rdma_write_us() const {
@@ -643,6 +647,9 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
 }
 
 void Proxy::post_gpu_command(uint64_t& my_tail, size_t& seen) {
+  // D2H queues may be populated after construction (deferred allocation).
+  if (!d2h_ready_.load(std::memory_order_acquire)) return;
+
   // Multi-ring buffer processing: collect commands from all ring buffers
   // Process each ring buffer (similar to test_multi_ring_throughput.cu)
   for (size_t rb_idx = 0; rb_idx < cfg_.d2h_queues.size(); rb_idx++) {

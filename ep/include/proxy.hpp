@@ -76,6 +76,21 @@ class Proxy {
   void run_remote();
   void run_local();
   void run_dual();
+  void run_dual_poll_only();  // Resume polling without re-init
+
+#ifdef USE_LIBFABRIC
+  // MPI-based init: split init_common into phases so the main thread can
+  // do the FabricConnectionInfo exchange via MPI instead of TCP.
+  //
+  // Phase 1 (proxy thread): fabric_init + get local info.
+  void init_fabric_local(FabricConnectionInfo& out_local_info);
+  // Phase 2 (main thread, after MPI exchange): insert all peers.
+  void init_fabric_insert_peers(
+      int num_ranks,
+      std::vector<FabricConnectionInfo> const& remote_infos);
+  // Phase 3 (proxy thread): pre-post recvs + enter polling loop.
+  void run_dual_after_init();
+#endif
   void pin_thread_to_cpu_wrapper();
   void pin_thread_to_numa_wrapper();
   void destroy(bool free_gpu_buffer);
@@ -86,6 +101,17 @@ class Proxy {
 
   void set_peers_meta(std::vector<PeerMeta> const& peers);
   void set_bench_d2h_channel_addrs(std::vector<uintptr_t> const& addrs);
+
+  // Replace D2H queues after construction (e.g. after fabric_init which
+  // invalidates pre-existing CUDA host allocations on CXI).
+  void update_d2h_queues(std::vector<d2hq::HostD2HHandle> const& queues) {
+    cfg_.d2h_queues = queues;
+#ifndef USE_MSCCLPP_FIFO_BACKEND
+    ring_tails_.assign(queues.size(), 0);
+    ring_seen_.assign(queues.size(), 0);
+#endif
+    d2h_ready_.store(true, std::memory_order_release);
+  }
 
   CopyRingBuffer ring;
   Config cfg_;
@@ -132,6 +158,9 @@ class Proxy {
   void* atomic_buffer_ptr_;
   std::vector<TransferCmd> postponed_atomics_;
   std::vector<uint64_t> postponed_wr_ids_;
+
+  // Set to true after update_d2h_queues(); gates post_gpu_command().
+  std::atomic<bool> d2h_ready_{false};
 
 #ifdef USE_LIBFABRIC
   FabricCtx fabric_ctx_;

@@ -17,7 +17,8 @@ UcclProxy::UcclProxy(int thread_idx, uintptr_t gpu_buffer_addr,
                      size_t total_size, int rank, int node_idx, int local_rank,
                      int num_experts, int num_ranks, int num_nodes,
                      bool use_normal_mode, bool is_intranode,
-                     bool gpu_buffer_is_host_allocated)
+                     bool gpu_buffer_is_host_allocated,
+                     bool defer_ring_alloc)
     : thread_{},
       mode_{Mode::None},
       running_{false},
@@ -28,19 +29,25 @@ UcclProxy::UcclProxy(int thread_idx, uintptr_t gpu_buffer_addr,
   thread_idx_ = thread_idx;
   gpu_buffer_addr_ = reinterpret_cast<void*>(gpu_buffer_addr);
 
-  cfg.d2h_queues.reserve(kChannelPerProxy);
-  d2h_queues.resize(kChannelPerProxy);
-  for (size_t i = 0; i < kChannelPerProxy; ++i) {
+  // When defer_ring_alloc is true, skip ring buffer allocation here.
+  // The caller must call reinit_ring_buffers() after all fabric_init
+  // calls complete (CXI fi_mr_regattr invalidates pre-existing CUDA
+  // host allocations).
+  if (!defer_ring_alloc) {
+    cfg.d2h_queues.reserve(kChannelPerProxy);
+    d2h_queues.resize(kChannelPerProxy);
+    for (size_t i = 0; i < kChannelPerProxy; ++i) {
 #ifdef USE_MSCCLPP_FIFO_BACKEND
-    auto fifo = std::make_unique<mscclpp::Fifo>(kQueueSize);
-    uintptr_t addr = reinterpret_cast<uintptr_t>(fifo.get());
-    fifos.push_back(std::move(fifo));
+      auto fifo = std::make_unique<mscclpp::Fifo>(kQueueSize);
+      uintptr_t addr = reinterpret_cast<uintptr_t>(fifo.get());
+      fifos.push_back(std::move(fifo));
 #else
-    uintptr_t addr = alloc_cmd_ring();
+      uintptr_t addr = alloc_cmd_ring();
 #endif
-    d2hq::init_from_addr(d2h_queues[i], addr);
-    cfg.d2h_queues.push_back(d2h_queues[i]);
-    d2h_channel_addrs_.push_back(addr);
+      d2hq::init_from_addr(d2h_queues[i], addr);
+      cfg.d2h_queues.push_back(d2h_queues[i]);
+      d2h_channel_addrs_.push_back(addr);
+    }
   }
 
   cfg.thread_idx = thread_idx;
